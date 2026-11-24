@@ -126,20 +126,26 @@ def run_lan(arg: str, kind: str, timeout: int = 300, bind_ip: str = None,
     tmp, payload = make_payload_dir(arg, kind, filename=filename)
     try:
         ip = bind_ip or detect_lan_ip()
-        expected_path = f"/{payload.name}"
+        token = secrets.token_urlsafe(16)
+        expected_path = f"/{token}/{payload.name}"
 
         class _Handler(http.server.SimpleHTTPRequestHandler):
             timeout = 10
 
-            def log_request(self, code="-", size="-"):
-                if self.command == "GET" and str(code) == "200" and self.path == expected_path:
+            def send_head(self):
+                if self.path != expected_path:
+                    self.send_error(404)
+                    return None
+                self.path = f"/{payload.name}"
+                result = super().send_head()
+                if result is not None:
                     self.server.served = True
-                super().log_request(code, size)
+                return result
 
         handler_cls = functools.partial(_Handler, directory=str(tmp))
         httpd = _OneShotServer((ip, 0), handler_cls)
         port = httpd.server_address[1]
-        url = f"http://{ip}:{port}/{payload.name}"
+        url = f"http://{ip}:{port}{expected_path}"
         digest = sha256_of(payload)
         print(f"URL: {url}")
         print(f"sha256: {digest}")
@@ -314,18 +320,6 @@ def discover_bluetooth_devices() -> list[str]:
     return devices
 
 
-def send_commands_to_device(ip: str, commands: str, port: int = 8765) -> None:
-    """Envía directamente a un Sendit receptor activo en la LAN."""
-    data = urllib.parse.urlencode({"commands": commands}).encode()
-    request = urllib.request.Request(
-        f"http://{ip}:{port}/", data=data, method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(request, timeout=4) as response:
-        if response.status != 200:
-            raise TransferError(f"el receptor devolvió HTTP {response.status}")
-
-
 def run_gui() -> None:
     """Abre la pantalla de Sendit para pegar comandos y transferirlos."""
     try:
@@ -396,8 +390,6 @@ def run_gui() -> None:
         except (OSError, TransferError, subprocess.CalledProcessError) as e:
             finish(f"URL del teléfono: {url} (QR no disponible: {e})")
 
-    selected_device = {"value": []}
-
     def finish(message):
         root.after(0, lambda: status.set(message))
 
@@ -414,7 +406,7 @@ def run_gui() -> None:
                 device_list.insert("end", "No hay vecinos detectados todavía")
                 status.set("No se detectaron equipos. Comprueba la misma Wi-Fi.")
             else:
-                status.set(f"{len(devices)} equipo(s) LAN detectado(s). Selecciona uno.")
+                status.set(f"{len(devices)} equipo(s) LAN detectado(s).")
         except TransferError as e:
             status.set(f"Error buscando la LAN: {e}")
 
@@ -442,15 +434,6 @@ def run_gui() -> None:
         except TransferError as e:
             status.set(f"Error buscando Bluetooth: {e}")
 
-    def select_device(_event=None):
-        selected_device["value"] = [
-            device_list.get(index).split(" | ")[1]
-            for index in device_list.curselection()
-            if " | " in device_list.get(index)
-        ]
-
-    device_list.bind("<<ListboxSelect>>", select_device)
-
     def send_phone():
         commands = text.get("1.0", "end-1c").strip()
         if not commands:
@@ -460,27 +443,11 @@ def run_gui() -> None:
         threading.Thread(target=lambda: transfer(commands), daemon=True).start()
 
     def transfer(commands):
-        targets = list(selected_device["value"])
-        delivered = []
-        pending = []
-        for target in targets:
-            try:
-                send_commands_to_device(target, commands)
-                delivered.append(target)
-            except (OSError, TransferError):
-                pending.append(target)
-        if targets and not pending:
-            finish("Enviado directamente a: " + ", ".join(delivered))
-            return
         try:
             link = {}
             run_lan(commands, "text", filename=COMMANDS_FILENAME, _url_sink=link,
                     _ready_callback=lambda url: root.after(0, lambda: show_qr(url)))
-            if pending:
-                targets_text = ", ".join(pending)
-                finish(f"Directo: {', '.join(delivered) or 'ninguno'}. Escanea el QR en: {targets_text}. URL: {link.get('url', '')}")
-            else:
-                finish(f"Listo para el teléfono. Escanea el QR o abre: {link.get('url', '')}")
+            finish(f"Listo para el teléfono. Escanea el QR o abre: {link.get('url', '')}")
         except TransferError as e:
             finish(f"Error: {e}")
 
@@ -501,7 +468,7 @@ def run_gui() -> None:
 
     buttons = tk.Frame(root)
     buttons.pack(fill="x", padx=18, pady=(0, 16))
-    tk.Button(buttons, text="ENVIAR A SELECCIONADOS", command=send_phone,
+    tk.Button(buttons, text="ENVIAR (QR / enlace)", command=send_phone,
               bg="#1769aa", fg="white", padx=16, pady=8).pack(side="left")
     tk.Button(buttons, text="RECIBIR DESDE EL TELÉFONO", command=receive_phone,
               padx=12, pady=8).pack(side="left", padx=8)
@@ -540,13 +507,18 @@ def run_receive(timeout: int = 300, bind_ip: str = None,
             else:
                 self.send_error(404)
 
+        timeout = 10
+
         def do_POST(self):
             if self.path != token_path:
                 self.send_error(404)
                 return
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 1024 * 1024:
-                self.send_error(413, "mensaje demasiado grande")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if not 0 <= length <= 1024 * 1024:
+                self.send_error(413, "mensaje demasiado grande o invalido")
                 return
             form = urllib.parse.parse_qs(
                 self.rfile.read(length).decode("utf-8", errors="replace")
